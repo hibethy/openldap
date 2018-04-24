@@ -960,7 +960,9 @@ backsql_id2entry( backsql_srch_info *bsi, backsql_entryID *eid )
 		return rc;
 	}
 
-	if ( bsi->bsi_attrs == NULL || ( bsi->bsi_flags & BSQL_SF_ALL_USER ) )
+	if ( bsi->bsi_attrs == NULL || ( bsi->bsi_flags & BSQL_SF_ALL_USER ) ||
+          ( strncasecmp(BACKSQL_OC_NAME(bsi->bsi_oc),
+                    "alias", STRLENOF("alias")) == 0 ) )
 	{
 		Debug( LDAP_DEBUG_TRACE, "backsql_id2entry(): "
 			"retrieving all attributes\n", 0, 0, 0 );

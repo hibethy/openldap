@@ -1,0 +1,12 @@
+is -f backsql_create.sql
+is -f testdb_create.sql
+is -f testdb_metadata.sql
+is -f testdb_data.sql
+
+ldapsearch -H ldap://127.0.0.1:3890 -x -D "cn=Manager,dc=example,dc=com" -w secret -b "dc=example,dc=com" 
+ldapadd -H ldap://127.0.0.1:3890 -x -D "cn=Manager,dc=example,dc=com" -w secret -f add1.ldif
+ldapsearch -H ldap://127.0.0.1:3890 -x -D "cn=Manager,dc=example,dc=com" -w secret -b "dc=example,dc=com" "(cn=Young*)"
+ldapadd -H ldap://127.0.0.1:3890 -x -D "cn=Manager,dc=example,dc=com" -w secret -f add2.ldif
+ldapmodify -H ldap://127.0.0.1:3890 -x -D "cn=Manager,dc=example,dc=com" -w secret -f mod.ldif
+ldapdelete -H ldap://127.0.0.1:3890 -x -D "cn=Manager,dc=example,dc=com" -w secret 'cn=Younghee Bae,dc=example,dc=com'
+ldapdelete -H ldap://127.0.0.1:3890 -x -D "cn=Manager,dc=example,dc=com" -w secret 'documentTitle=book3,dc=example,dc=com'

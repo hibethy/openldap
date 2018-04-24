@@ -172,6 +172,8 @@ int backsql_destroy_schema_map( backsql_info *si );
  * search.c
  */
 
+extern backsql_at_map_rec *backsql_aliasedObjectName_map;
+
 int backsql_init_search( backsql_srch_info *bsi, 
 		struct berval *nbase, int scope,
 		time_t stoptime, Filter *filter, SQLHDBC dbh,

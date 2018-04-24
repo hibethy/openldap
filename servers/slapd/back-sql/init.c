@@ -54,6 +54,7 @@ sql_back_initialize(
 #if 0
 		SLAP_BFLAG_INCREMENT |
 #endif
+		SLAP_BFLAG_ALIASES |
 		SLAP_BFLAG_REFERRALS;
 
 	Debug( LDAP_DEBUG_TRACE,"==>sql_back_initialize()\n", 0, 0, 0 );

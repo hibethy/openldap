@@ -33,6 +33,8 @@
 
 #define BACKSQL_DUPLICATE	(-1)
 
+backsql_at_map_rec *backsql_aliasedObjectName_map;
+
 /* NOTE: by default, cannot just compare pointers because
  * objectClass/attributeType order would be machine-dependent
  * (and tests would fail!); however, if you don't want to run
@@ -472,6 +474,13 @@ backsql_oc_get_attr_mapping( void *v_oc, void *v_bas )
 					oc_map->bom_oc->soc_cname.bv_val, 0 );
 			ch_free( at_map );
 		}
+        
+        /* for dereferencing alias, store aliasedObjectName attribute */
+        if ( strncasecmp( BACKSQL_OC_NAME( oc_map ), "alias", STRLENOF( "alias" ) ) == 0 &&
+             strncasecmp( at_row.cols[0], "aliasedObjectName", STRLENOF("aliasedObjectName") ) == 0 )
+        {
+            backsql_aliasedObjectName_map = at_map;
+        }
 
 		if ( !BER_BVISNULL( &bas->bas_bi->sql_upper_func ) &&
 				BER_BVISNULL( &at_map->bam_sel_expr_u ) )

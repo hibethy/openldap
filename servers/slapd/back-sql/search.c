@@ -41,6 +41,7 @@ static int backsql_process_filter_like( backsql_srch_info *bsi,
 		int casefold, struct berval *filter_value );
 static int backsql_process_filter_attr( backsql_srch_info *bsi, Filter *f, 
 		backsql_at_map_rec *at );
+static int backsql_search_internal( Operation *op, SlapReply *rs, SQLHDBC dbh );
 
 /* For LDAP_CONTROL_PAGEDRESULTS, a 32 bit cookie is available to keep track of
    the state of paged results. The ldap_entries.id and oc_map_id values of the
@@ -160,6 +161,8 @@ backsql_init_search(
 
 	bsi->bsi_attrs = NULL;
 
+    Debug( LDAP_DEBUG_TRACE, "==>backsql_init_search()\n", 0, 0, 0 );
+    
 	if ( BACKSQL_FETCH_ALL_ATTRS( bi ) ) {
 		/*
 		 * if requested, simply try to fetch all attributes
@@ -369,7 +372,8 @@ backsql_init_search(
 		break;
 	}
 
-	return rc;
+	Debug( LDAP_DEBUG_TRACE, "<==backsql_init_search()\n", 0, 0, 0 );
+    return rc;
 }
 
 static int
@@ -1011,7 +1015,11 @@ backsql_process_filter( backsql_srch_info *bsi, Filter *f )
 		goto done;
 	}
 
-	if ( vat == NULL ) {
+	if ( vat == NULL ||
+        /* for alias, don't need to apply attr */
+        ( ( bsi->bsi_op->ors_deref & LDAP_DEREF_SEARCHING ) &&
+          ( strncasecmp(BACKSQL_OC_NAME(bsi->bsi_oc),
+                    "alias", STRLENOF("alias")) == 0 ) ) ) {
 		/* search anyway; other parts of the filter
 		 * may succeed */
 		backsql_strfcat_x( &bsi->bsi_flt_where,
@@ -1603,6 +1611,10 @@ backsql_srch_query( backsql_srch_info *bsi, struct berval *query )
 	if ( rc > 0 ) {
 		struct berbuf	bb = BB_NULL;
 
+        Debug( LDAP_DEBUG_TRACE,
+                "backsql_srch_query() oc_name: [%s], deref[%d], base_ndn[%s]\n",
+                BACKSQL_OC_NAME(bsi->bsi_oc), bsi->bsi_op->ors_deref, bsi->bsi_base_ndn->bv_val);
+                
 		backsql_strfcat_x( &bb,
 				bsi->bsi_op->o_tmpmemctx,
 				"bbblb",
@@ -1611,6 +1623,21 @@ backsql_srch_query( backsql_srch_info *bsi, struct berval *query )
 				&bsi->bsi_join_where.bb_val,
 				(ber_len_t)STRLENOF( " AND " ), " AND ",
 				&bsi->bsi_flt_where.bb_val );
+
+        /*
+         * for dereferencing alias,
+         * select alias entries where base dn != target's base dn.
+         */
+        if ( ( bsi->bsi_op->ors_deref & LDAP_DEREF_SEARCHING ) &&
+             ( strncasecmp(BACKSQL_OC_NAME(bsi->bsi_oc),
+                              "alias", STRLENOF("alias") ) == 0 ) ) {
+            backsql_strfcat_x( &bb,
+                    bsi->bsi_op->o_tmpmemctx,
+                    "lbl",
+                    (ber_len_t)STRLENOF( " AND UPPER(" ), " AND UPPER(",
+                    &backsql_aliasedObjectName_map->bam_sel_expr,
+                    (ber_len_t)STRLENOF( ") NOT LIKE ?" ), ") NOT LIKE ?" );
+        }
 
 		*query = bb.bb_val;
 
@@ -1665,7 +1692,8 @@ backsql_oc_get_candidates( void *v_oc, void *v_bsi )
 	 * search for a DN BACKSQL_MAX_DN_LEN long legal 
 	 * if it returns that DN only
 	 */
-	char			tmp_base_ndn[ BACKSQL_MAX_DN_LEN + 1 + 1 ];
+	char            tmp_base_ndn[ BACKSQL_MAX_DN_LEN + 1 + 1 ] = {0,};
+	char            alias_base_ndn[ BACKSQL_MAX_DN_LEN + 1 + 1 ] = {0,};
 
 	bsi->bsi_status = LDAP_SUCCESS;
  
@@ -1896,6 +1924,37 @@ backsql_oc_get_candidates( void *v_oc, void *v_bsi )
 		}
 		break;
 	}
+    
+    /*
+     * for dereferencing alias,
+     * select alias entries where base dn != target's base dn.
+     */
+    if ( ( bsi->bsi_op->ors_deref & LDAP_DEREF_SEARCHING ) &&
+            ( strncasecmp(BACKSQL_OC_NAME(bsi->bsi_oc),
+                          "alias", STRLENOF("alias") ) == 0 ) ) {
+        int i = 0;
+
+        alias_base_ndn[ i++ ] = '%';
+
+        AC_MEMCPY( &alias_base_ndn[ i ], bsi->bsi_base_ndn->bv_val,
+            bsi->bsi_base_ndn->bv_len + 1 );
+
+        if ( BACKSQL_CANUPPERCASE( bi ) ) {
+            ldap_pvt_str2upper( alias_base_ndn );
+        }
+
+        Debug( LDAP_DEBUG_TRACE, "backsql_oc_get_candidates(): "
+                "binding base_ndn parameter (3): [%s]\n",
+                alias_base_ndn, 0, 0 );
+        rc = backsql_BindParamStr( sth, 3, SQL_PARAM_INPUT,
+                alias_base_ndn, BACKSQL_MAX_DN_LEN );
+        if ( rc != SQL_SUCCESS ) {
+            backsql_PrintErrors( bi->sql_db_env, bsi->bsi_dbh,
+                    sth, rc );
+            bsi->bsi_status = LDAP_OTHER;
+            return BACKSQL_AVL_CONTINUE;
+        }
+    }
 	
 	rc = SQLExecute( sth );
 	if ( !BACKSQL_SUCCESS( rc ) ) {
@@ -1995,8 +2054,33 @@ cleanup:;
 int
 backsql_search( Operation *op, SlapReply *rs )
 {
+    int         sres;
+    SQLHDBC         dbh = SQL_NULL_HDBC;
+
+    sres = backsql_get_db_conn( op, &dbh );
+    if ( sres != LDAP_SUCCESS ) {
+        Debug( LDAP_DEBUG_TRACE, "backsql_search(): "
+            "could not get connection handle - exiting\n",
+            0, 0, 0 );
+        rs->sr_err = sres;
+        rs->sr_text = sres == LDAP_OTHER ?  "SQL-backend error" : NULL;
+        send_ldap_result( op, rs );
+        return 1;
+    }
+
+    sres = backsql_search_internal( op, rs, dbh );
+
+    if ( sres == LDAP_SUCCESS ) {
+        send_ldap_result( op, rs );
+    }
+
+    return sres;
+}
+
+int
+backsql_search_internal( Operation *op, SlapReply *rs, SQLHDBC dbh )
+{
 	backsql_info		*bi = (backsql_info *)op->o_bd->be_private;
-	SQLHDBC			dbh = SQL_NULL_HDBC;
 	int			sres;
 	Entry			user_entry = { 0 },
 				base_entry = { 0 };
@@ -2005,6 +2089,7 @@ backsql_search( Operation *op, SlapReply *rs )
 	backsql_srch_info	bsi = { 0 };
 	backsql_entryID		*eid = NULL;
 	struct berval		nbase = BER_BVNULL;
+	struct berval		ndn = BER_BVNULL;
 #ifndef BACKSQL_ARBITRARY_KEY
 	ID			lastid = 0;
 #endif /* ! BACKSQL_ARBITRARY_KEY */
@@ -2034,22 +2119,12 @@ backsql_search( Operation *op, SlapReply *rs )
 		return 1;
 	}
 
-	sres = backsql_get_db_conn( op, &dbh );
-	if ( sres != LDAP_SUCCESS ) {
-		Debug( LDAP_DEBUG_TRACE, "backsql_search(): "
-			"could not get connection handle - exiting\n", 
-			0, 0, 0 );
-		rs->sr_err = sres;
-		rs->sr_text = sres == LDAP_OTHER ?  "SQL-backend error" : NULL;
-		send_ldap_result( op, rs );
-		return 1;
-	}
-
 	/* compute it anyway; root does not use it */
 	stoptime = op->o_time + op->ors_tlimit;
 
 	/* init search */
 	bsi.bsi_e = &base_entry;
+init_search:
 	rs->sr_err = backsql_init_search( &bsi, &op->o_req_ndn,
 			op->ors_scope,
 			stoptime, op->ors_filter,
@@ -2057,6 +2132,29 @@ backsql_search( Operation *op, SlapReply *rs )
 			( BACKSQL_ISF_MATCHED | BACKSQL_ISF_GET_ENTRY ) );
 	switch ( rs->sr_err ) {
 	case LDAP_SUCCESS:
+        if ( (op->ors_deref & LDAP_DEREF_FINDING) &&
+              is_entry_alias( bsi.bsi_e ) ) {
+            if ( get_alias_dn(bsi.bsi_e, &op->o_req_ndn,
+                        &rs->sr_err, &rs->sr_text) ) {
+                entry_clean( &base_entry );
+                goto done;
+            }
+
+            (void)backsql_free_entryID( &bsi.bsi_base_id, 0, op->o_tmpmemctx );
+            bsi.bsi_base_id.eid_oc = NULL;
+
+            if ( bsi.bsi_attrs != NULL ) {
+                op->o_tmpfree( bsi.bsi_attrs, op->o_tmpmemctx );
+                bsi.bsi_attrs = NULL;
+            }
+
+            if ( !BER_BVISNULL( &nbase )
+                    && nbase.bv_val != op->o_req_ndn.bv_val )
+            {
+                ch_free( nbase.bv_val );
+            }
+            goto init_search;
+        }
 		break;
 
 	case LDAP_REFERRAL:
@@ -2297,6 +2395,58 @@ backsql_search( Operation *op, SlapReply *rs )
 			e = &user_entry;
 		}
 
+        if ( !dn_match( &eid->eid_ndn, &op->o_req_ndn) &&
+                (op->ors_deref & LDAP_DEREF_SEARCHING) &&
+                op->ors_scope != LDAP_SCOPE_BASE &&
+                op->ors_scope != BACKSQL_SCOPE_BASE_LIKE &&
+                is_entry_alias( e ) ) {
+            if ( get_alias_dn(e, &ndn, &rs->sr_err, &rs->sr_text) ) {
+                /* error */
+                goto next_entry;
+            }
+            backsql_srch_info   bsi2 = { 0 };
+            Entry           user_entry2 = { 0 };
+
+            /*
+             * change op->ors_deref to ALWAYS
+             * if one-level scope, change base scope
+             * if subtree scope, keep subtree scope
+             */
+            int tmp_scope;
+            int tmp_deref;
+            struct berval tmp_dn;
+            AttributeName *tmp_attrs;
+
+            tmp_dn = op->o_req_ndn;
+            tmp_deref = op->ors_deref;
+            tmp_scope = op->ors_scope;
+            tmp_attrs = op->ors_attrs;
+
+            op->o_req_ndn = ndn;
+            op->ors_deref = LDAP_DEREF_ALWAYS;
+            op->ors_scope = (op->ors_scope == LDAP_SCOPE_ONE)?
+                LDAP_SCOPE_BASE : LDAP_SCOPE_SUBTREE;
+            op->ors_attrs = NULL;
+
+            Debug( LDAP_DEBUG_TRACE, "backsql_search_internal(): dereference alias", 0, 0, 0);
+
+            sres = backsql_search_internal( op, rs, dbh );
+            if ( sres != LDAP_SUCCESS ) {
+                Debug( LDAP_DEBUG_TRACE, "backsql_search_internal(): "
+                        "error in nested backsql_search_internal()\n",
+                        0, 0, 0 );
+                rs->sr_err = sres;
+                send_ldap_result( op, rs );
+                return 1;
+            }
+
+            op->o_req_ndn = tmp_dn;
+            op->ors_scope = tmp_scope;
+            op->ors_deref = tmp_deref;
+            op->ors_attrs = tmp_attrs;
+
+            goto next_entry;
+        }
 		if ( !manageDSAit &&
 				op->ors_scope != LDAP_SCOPE_BASE &&
 				op->ors_scope != BACKSQL_SCOPE_BASE_LIKE &&
@@ -2491,7 +2641,7 @@ send_results:;
 		} else
 #endif /* ! BACKSQL_ARBITRARY_KEY */
 		{
-			send_ldap_result( op, rs );
+			//send_ldap_result( op, rs );
 		}
 	}
 
